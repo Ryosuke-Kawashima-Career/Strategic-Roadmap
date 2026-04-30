@@ -20,10 +20,20 @@ The ``expand_scenario`` op is the sole exception: it *does* rewire
 into a newly-appended node is the whole point of the operation. The rewire is
 validated to only touch terminal branches so an expansion can never silently
 detach a mid-scenario edge.
+
+Probability invariant: every node that gains or hosts a new branch is
+left with branch probabilities summing to 1.0 (within ``PROB_EPS``). For
+``add_branch`` and the ``fork_from`` path of ``add_node`` the new branch
+keeps the LLM-supplied probability and the previously-existing branches
+are scaled proportionally; for the ``add_node`` op's own freshly-authored
+branches, every branch is scaled uniformly. The simulator's
+``test_branch_probabilities_sum_to_one_per_node`` invariant therefore
+holds on every patched scenario without the LLM having to pre-balance.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 
@@ -39,6 +49,11 @@ KNOWN_EXTERNAL_DRIVERS = frozenset({
 
 class DiffError(ValueError):
     """Raised when a diff operation is malformed or references unknown entities."""
+
+
+# Tolerance for the "branch probabilities sum to 1.0" invariant. Matches the
+# ± 0.001 wording the system preamble uses with the LLM.
+PROB_EPS = 1e-3
 
 
 # Fields Claude is allowed to set. Anything else raises DiffError.
@@ -149,20 +164,208 @@ def _add_branch(scenario: Dict[str, Any], diff: Dict[str, Any]) -> None:
     if any(b["id"] == branch["id"] for b in node["branches"]):
         raise DiffError(f"Branch id {branch['id']!r} already exists on {node_id!r}")
     node["branches"].append(branch)
+    # Keep the host node's distribution a valid PMF — scale the previously-
+    # existing branches so the total sums back to 1.0.
+    _renormalize_after_branch_add(node, branch["id"])
 
 
 def _add_node(scenario: Dict[str, Any], diff: Dict[str, Any]) -> None:
     node = _require(diff, "node")
     if not isinstance(node, dict):
         raise DiffError("`node` must be an object")
+
+    if "id" not in node:
+        raise DiffError("New node missing required field: 'id'")
+
+    # Phase 10.5 ID coherence: the LLM sometimes picks a numerically-misleading
+    # id (e.g. "tp-099" for a node squeezed between tp-002 and tp-003) or a
+    # duplicate of an existing id. Override with the next free sequential
+    # `tp-NNN` so the numeric suffix tracks chronological insertion order and
+    # the diff never fails on an id collision. The original (LLM-supplied) id
+    # is captured here so we can re-prefix any branch ids the LLM tied to it.
+    requested_id = node["id"]
+    canonical_id = _assign_chronological_id(scenario, requested_id)
+    if canonical_id != requested_id:
+        node["id"] = canonical_id
+        # Re-prefix the new node's own branch ids when they were keyed off
+        # the LLM's id (e.g. "tp-099-a" → "tp-004-a"). Branches whose ids
+        # don't carry the prefix (LLM picked an unrelated naming) are left
+        # alone; the duplicate-id check on the host node will catch any
+        # accidental collisions.
+        if isinstance(node.get("branches"), list):
+            prefix = requested_id + "-"
+            for b in node["branches"]:
+                bid = b.get("id")
+                if isinstance(bid, str) and bid.startswith(prefix):
+                    b["id"] = canonical_id + "-" + bid[len(prefix):]
+
+    # Phase 10.5 mergeability fix: the LLM occasionally generates a node
+    # without an explicit `branches` array — particularly for divergent
+    # forks where the narrative focus is on the node itself, not its
+    # outgoing decisions. Rather than rejecting the diff (which blocks the
+    # whole merge), synthesize a single terminal "Continue" branch so the
+    # new node is a valid leaf and the rest of the wiring can proceed.
+    # The branch carries probability 1.0 and a neutral metric_delta so the
+    # simulator treats the node as a no-op decision point until a follow-up
+    # /revise enriches it.
+    if not isinstance(node.get("branches"), list) or not node.get("branches"):
+        node["branches"] = [_default_terminal_branch(node["id"])]
+
     for req in ("id", "year", "title", "description", "external_driver", "branches"):
         if req not in node:
             raise DiffError(f"New node missing required field: {req!r}")
-    if not isinstance(node["branches"], list) or not node["branches"]:
-        raise DiffError("new node must carry at least one branch")
+    # The canonical-id pass already guarantees uniqueness, but keep the
+    # defensive check as a hard floor in case future code paths bypass it.
     if any(n["id"] == node["id"] for n in scenario["nodes"]):
         raise DiffError(f"Node id {node['id']!r} already exists")
+
+    # Branches on the new node are the new terminal frontier unless the caller
+    # supplied an explicit edge — match _expand_scenario's convention so the
+    # downstream simulator never sees an undefined `next_node_id`.
+    for b in node["branches"]:
+        b.setdefault("next_node_id", None)
+
+    # The new node's own branches must form a valid PMF (sum to 1.0). The LLM
+    # authors them all together so uniform rescaling preserves the relative
+    # distribution exactly.
+    _normalize_node_branches_uniform(node)
+
+    # Phase 10.5 — chronological invariant: the HEAD of the new branch (this
+    # node) must be reachable only from predecessors at year ≤ new_year. The
+    # year is parsed once here and reused by every wiring guard below.
+    try:
+        new_year = int(node["year"])
+    except (TypeError, ValueError):
+        raise DiffError(
+            f"new node year must be an integer, got {node['year']!r}"
+        )
+
+    # ── Divergence wiring (Phase 9.5) ───────────────────────────────────────
+    # `fork_from` sprouts a NEW branch on each listed past node, pointing at
+    # the new node. Existing branches on those nodes stay untouched, so the
+    # original storyline remains explorable alongside the divergent fork.
+    # Buffer the (host_node, new_branch) pairs so the operation stays atomic —
+    # the connectivity guard below may abort the whole add_node.
+    fork_raw = diff.get("fork_from")
+    if fork_raw is not None and not isinstance(fork_raw, list):
+        raise DiffError("`fork_from` must be a list of {from_node_id, branch} entries")
+    fork_from = fork_raw or []
+
+    fork_targets: List[Dict[str, Any]] = []  # [{"host": host_node, "branch": new_branch}, ...]
+    for item in fork_from:
+        if not isinstance(item, dict):
+            raise DiffError("fork_from entries must be objects")
+        host_id = _require(item, "from_node_id")
+        new_branch = _require(item, "branch")
+        if not isinstance(new_branch, dict):
+            raise DiffError("`fork_from.branch` must be an object")
+        for req in ("id", "label", "description", "metric_delta", "probability"):
+            if req not in new_branch:
+                raise DiffError(f"fork_from.branch missing required field: {req!r}")
+        md = new_branch["metric_delta"]
+        if not isinstance(md, dict):
+            raise DiffError("fork_from.branch.metric_delta must be an object")
+        for req in ("revenue_index", "market_share", "tech_adoption_velocity"):
+            if req not in md:
+                raise DiffError(f"fork_from.branch.metric_delta missing: {req!r}")
+
+        # Phase 10.5 mergeability: if the LLM hallucinates a host_id, fall
+        # back to the chronologically-nearest predecessor (year < new_year)
+        # so the merge can still proceed instead of failing the whole diff.
+        # Strict resolution would just raise DiffError("Unknown node_id…").
+        host = _find_node(scenario, host_id, fallback_year=new_year)
+        if any(b["id"] == new_branch["id"] for b in host["branches"]):
+            raise DiffError(
+                f"fork_from.branch.id {new_branch['id']!r} already exists on "
+                f"node {host['id']!r} (resolved from requested {host_id!r})"
+            )
+        # Phase 10.5 chronological guard — defence in depth. The fallback
+        # path only ever returns a predecessor with year < new_year, so this
+        # only catches the case where the requested id WAS found but lives
+        # in the future relative to the new node.
+        host_year = _node_year(host)
+        if host_year > new_year:
+            raise DiffError(
+                f"chronological contradiction: cannot fork from node {host_id!r} "
+                f"(year {host_year}) into new node {node['id']!r} (year {new_year}) — "
+                f"the predecessor must not be in the future relative to the new node."
+            )
+        # The server is the single source of truth for this edge — overwrite
+        # whatever (if anything) the LLM tried to supply.
+        new_branch["next_node_id"] = node["id"]
+        fork_targets.append({"host": host, "branch": new_branch})
+
+    # ── Continuation wiring (Phase 9.4) ─────────────────────────────────────
+    # Resolution table (matches §9.5.2 of the spec):
+    #   rewire_from set → use its validated subset
+    #   rewire_from absent AND fork_from empty → auto-rewire all terminals
+    #   rewire_from absent AND fork_from non-empty → pure divergence, no auto
+    rewire_from = diff.get("rewire_from")
+    rewire_targets: List[Dict[str, Any]] = []
+
+    if rewire_from is not None:
+        if not isinstance(rewire_from, list):
+            raise DiffError("`rewire_from` must be a list of {node_id, branch_id} entries")
+        for item in rewire_from:
+            if not isinstance(item, dict):
+                raise DiffError("rewire_from entries must be objects")
+            rn_id = _require(item, "node_id")
+            rb_id = _require(item, "branch_id")
+            rn = _find_node(scenario, rn_id)
+            rb = next((x for x in rn["branches"] if x["id"] == rb_id), None)
+            if rb is None:
+                raise DiffError(f"rewire_from target branch {rb_id!r} not on node {rn_id!r}")
+            if rb.get("next_node_id") is not None:
+                raise DiffError(
+                    f"rewire_from target {rn_id}/{rb_id} already points at "
+                    f"{rb['next_node_id']!r} — only terminal branches can be rewired."
+                )
+            # Phase 10.5 — host year must be ≤ new node year.
+            rn_year = _node_year(rn)
+            if rn_year > new_year:
+                raise DiffError(
+                    f"chronological contradiction: cannot rewire branch {rb_id!r} on "
+                    f"node {rn_id!r} (year {rn_year}) into new node {node['id']!r} "
+                    f"(year {new_year}) — the predecessor must not be in the future "
+                    f"relative to the new node."
+                )
+            rewire_targets.append(rb)
+    elif not fork_targets:
+        # Neither field set → auto-rewire every terminal branch whose host
+        # node is chronologically valid (Phase 10.5). Terminals on nodes whose
+        # year > new_year would create backwards-in-time edges and are skipped.
+        for existing in scenario["nodes"]:
+            if _node_year(existing) > new_year:
+                continue
+            for b in existing["branches"]:
+                if b.get("next_node_id") is None:
+                    rewire_targets.append(b)
+
+    # ── Connectivity invariant guard (Phase 9.5.1 + 10.5) ──────────────────
+    # If neither explicit field was supplied AND auto-rewire found no
+    # chronologically-valid terminals (i.e. every terminal lives at year >
+    # new_year), the new node would be unreachable. Tell the LLM both
+    # remediation paths so it can retry without guessing.
+    if not rewire_targets and not fork_targets:
+        raise DiffError(
+            f"add_node {node['id']!r} (year {new_year}) would leave the new node "
+            "unreachable. Either supply `rewire_from` (continuation) or "
+            "`fork_from` (divergence) referencing a node whose year ≤ "
+            f"{new_year}, or pick a `year` strictly later than every existing "
+            "terminal so auto-rewire has a chronologically-valid candidate."
+        )
+
+    # ── Atomic mutation step ────────────────────────────────────────────────
     scenario["nodes"].append(node)
+    for branch in rewire_targets:
+        branch["next_node_id"] = node["id"]
+    for entry in fork_targets:
+        host = entry["host"]
+        host["branches"].append(entry["branch"])
+        # Fork branch was just appended to a previously-balanced host node —
+        # scale its existing branches so the distribution sums to 1.0 again
+        # (preserves the LLM's claimed probability for the new fork).
+        _renormalize_after_branch_add(host, entry["branch"]["id"])
 
 
 def _expand_scenario(scenario: Dict[str, Any], diff: Dict[str, Any]) -> None:
@@ -288,8 +491,196 @@ def _require(diff: Dict[str, Any], key: str) -> Any:
     return diff[key]
 
 
-def _find_node(scenario: Dict[str, Any], node_id: str) -> Dict[str, Any]:
+def _find_node(
+    scenario: Dict[str, Any],
+    node_id: str,
+    fallback_year: int = None,
+) -> Dict[str, Any]:
+    """Return the node with ``node_id``.
+
+    Strict by default: a missing id raises ``DiffError`` so typos in
+    ``set_node_field`` / ``set_branch_field`` / ``rewire_from`` paths surface
+    explicitly.
+
+    Phase 10.5 mergeability fallback: when ``fallback_year`` is supplied and
+    the exact id is missing, return the chronologically-latest node whose
+    year is strictly < ``fallback_year``. This lets the head of an LLM-
+    generated branch attach to the nearest plausible predecessor instead of
+    failing the whole diff when the model hallucinates a host_id. Callers
+    that want strict resolution simply omit ``fallback_year``.
+    """
     node = next((n for n in scenario["nodes"] if n["id"] == node_id), None)
-    if node is None:
+    if node is not None:
+        return node
+    if fallback_year is None:
         raise DiffError(f"Unknown node_id: {node_id!r}")
-    return node
+
+    candidates = [n for n in scenario["nodes"] if _node_year(n) < fallback_year]
+    if not candidates:
+        raise DiffError(
+            f"Unknown node_id: {node_id!r} — and no chronologically-prior "
+            f"node exists before year {fallback_year} to fall back on."
+        )
+    return max(candidates, key=_node_year)
+
+
+def _default_terminal_branch(node_id: str) -> Dict[str, Any]:
+    """Synthesize a single terminal branch for a node generated without one.
+
+    Used by ``_add_node`` to keep an LLM-emitted node mergeable when the
+    ``branches`` field is missing or empty (Phase 10.5). The branch claims
+    100% probability, a neutral metric_delta, and ``next_node_id`` is null
+    so the new node enters the scenario as a clean terminal leaf — exactly
+    how downstream consumers treat any other terminal branch.
+    """
+    return {
+        "id": f"{node_id}-a",
+        "label": "Continue",
+        "description": (
+            "Default continuation — no decision branch was specified for "
+            "this turning point. A follow-up /revise can replace this with "
+            "explicit alternatives."
+        ),
+        "probability": 1.0,
+        "metric_delta": {
+            "revenue_index": 0.0,
+            "market_share": 0.0,
+            "tech_adoption_velocity": 0.0,
+        },
+        "next_node_id": None,
+    }
+
+
+def _node_year(node: Dict[str, Any]) -> int:
+    """Coerce ``node["year"]`` to int, raising DiffError on malformed values.
+
+    Used by the Phase 10.5 chronological guards. Centralised so the
+    rewire / fork / auto-rewire paths all surface the same error wording.
+    """
+    raw = node.get("year")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise DiffError(
+            f"node {node.get('id')!r} has invalid year {raw!r} — expected an integer"
+        )
+
+
+# Recognises the ``tp-NNN`` node-id convention so we can pull out the
+# integer suffix and mint the next free one.
+_TP_ID_PATTERN = re.compile(r"^tp-(\d+)$")
+
+
+def _assign_chronological_id(scenario: Dict[str, Any], requested_id: str) -> str:
+    """Return a ``tp-NNN`` id that is unique AND monotonically increasing.
+
+    Phase 10.5 ID-coherence fix: the LLM occasionally picks an id like
+    ``tp-099`` for a node that lives between existing turning points (e.g.
+    year 2030 with tp-001 / tp-002 / tp-003 in place), which makes the
+    numeric suffix lie about the chronological position. It also sometimes
+    reuses an existing id — a hard duplicate failure. Both cases are fixed
+    here by computing ``max(existing tp-NNN) + 1`` and only honouring the
+    LLM's requested id when it already matches that next-free integer.
+
+    Returns the requested id if it is already coherent and unique;
+    otherwise returns the freshly-minted next-sequential id.
+    """
+    existing_ids = {n["id"] for n in scenario["nodes"]}
+    existing_nums: List[int] = []
+    for nid in existing_ids:
+        m = _TP_ID_PATTERN.match(nid)
+        if m:
+            existing_nums.append(int(m.group(1)))
+    next_num = (max(existing_nums) + 1) if existing_nums else 1
+    canonical = f"tp-{next_num:03d}"
+
+    # Honour the LLM's id only if it IS the canonical next sequence.
+    # Otherwise (misaligned suffix, duplicate, non-tp-NNN naming) override.
+    if requested_id == canonical and requested_id not in existing_ids:
+        return requested_id
+    return canonical
+
+
+def _renormalize_after_branch_add(node: Dict[str, Any], new_branch_id: str) -> None:
+    """Re-scale the previously-existing branches on `node` after a new branch
+    has been appended, so the host's branch probabilities sum to 1.0.
+
+    The newly-added branch keeps its supplied probability; the prior branches
+    are scaled by ``(1.0 - new_prob) / existing_total``. This preserves the
+    relative shape of the original distribution and the LLM's claim about
+    how likely the new branch is — matching the §9.5.6 system-preamble
+    contract ("the simulator normalises… do NOT rebalance").
+
+    Raises ``DiffError`` when the new branch's probability is out of range
+    or when the existing branches sum to zero (no shape to preserve).
+    """
+    new_branch = next((b for b in node["branches"] if b["id"] == new_branch_id), None)
+    if new_branch is None:  # defensive — caller just appended it
+        raise DiffError(f"Branch {new_branch_id!r} not found on node {node['id']!r}")
+
+    try:
+        new_prob = float(new_branch["probability"])
+    except (TypeError, ValueError, KeyError):
+        raise DiffError(
+            f"Branch {new_branch_id!r} probability must be numeric, "
+            f"got {new_branch.get('probability')!r}"
+        )
+    if not (0.0 <= new_prob <= 1.0):
+        raise DiffError(
+            f"Branch {new_branch_id!r} probability must be in [0, 1], got {new_prob}"
+        )
+    if new_prob > 1.0 - PROB_EPS:
+        raise DiffError(
+            f"Branch {new_branch_id!r} probability {new_prob} leaves no room for "
+            f"the existing branches at node {node['id']!r}. Pick a value < 1.0."
+        )
+
+    existing = [b for b in node["branches"] if b["id"] != new_branch_id]
+    if not existing:
+        # Single-branch node: clamp to 1.0 so the invariant holds.
+        new_branch["probability"] = 1.0
+        return
+
+    existing_total = sum(float(b["probability"]) for b in existing)
+    if existing_total <= 0:
+        raise DiffError(
+            f"Node {node['id']!r}: existing branches sum to {existing_total}; "
+            f"cannot rescale to fit the new branch."
+        )
+    scale = (1.0 - new_prob) / existing_total
+    for b in existing:
+        b["probability"] = float(b["probability"]) * scale
+
+
+def _normalize_node_branches_uniform(node: Dict[str, Any]) -> None:
+    """Scale every branch on `node` so their probabilities sum to 1.0.
+
+    Used for the new node minted by ``_add_node`` — the LLM authors all of
+    its branches together, so uniform rescaling preserves the relative
+    shape exactly. No-op when the sum is already in tolerance.
+    """
+    for b in node["branches"]:
+        try:
+            p = float(b["probability"])
+        except (TypeError, ValueError, KeyError):
+            raise DiffError(
+                f"Branch {b.get('id')!r} probability must be numeric, "
+                f"got {b.get('probability')!r}"
+            )
+        if p < 0:
+            raise DiffError(
+                f"Branch {b.get('id')!r} probability must be non-negative, got {p}"
+            )
+        b["probability"] = p
+
+    total = sum(float(b["probability"]) for b in node["branches"])
+    if total <= 0:
+        raise DiffError(
+            f"Node {node['id']!r}: branch probabilities sum to {total}; "
+            f"cannot normalize. Provide non-zero probabilities."
+        )
+    if abs(total - 1.0) <= PROB_EPS:
+        return
+    factor = 1.0 / total
+    for b in node["branches"]:
+        b["probability"] = float(b["probability"]) * factor

@@ -32,6 +32,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -39,10 +40,11 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import anthropic
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 # Import `apply_diff` — prefer the package form, fall back for direct-module execution.
 try:
@@ -62,9 +64,11 @@ UI_PATH = PROJECT_ROOT / "src" / "ui" / "index.html"
 
 # Model choices come from §8.2 of the plan — do not change without a plan update.
 CHAT_MODEL = "claude-sonnet-4-6"   # latency-sensitive
-REVISE_MODEL = "claude-opus-4-7"   # accuracy-sensitive, lower frequency
+REVISE_MODEL = "claude-sonnet-4-6"   # accuracy-sensitive, lower frequency (e.g. claude-opus-4-7)
 
-ROADMAP_API_KEY = os.environ.get("ROADMAP_API_KEY", "roadmap-api-key")
+load_dotenv()
+ROADMAP_API_KEY = os.getenv("ROADMAP_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Shared Claude client (async). Constructed on first use so the process can
 # start without ANTHROPIC_API_KEY and surface 503s on Claude-calling routes
@@ -169,7 +173,38 @@ REVISE_SYSTEM_PREAMBLE = (
     "(except when the op is `add_node` or `add_branch`, where you mint new "
     "IDs following the existing pattern like tp-004 or tp-002-d). "
     "Do not modify `next_node_id`, the `timeline` array, or any `metadata.*` "
-    "field — those are out of scope for this tool."
+    "field — those are out of scope for this tool. "
+    "When the op is `add_node`, the server auto-rewires every currently-terminal "
+    "branch (branches whose `next_node_id` is null) into the new node so the "
+    "DAG stays connected. Use the optional `rewire_from` list ONLY when the "
+    "scenario has multiple terminal paths that serve different story lines and "
+    "only one should flow into the new node — list the specific "
+    "{node_id, branch_id} pairs to rewire and leave the rest terminal. "
+
+    "Pick the wiring mode for `add_node` based on the user's framing: "
+    "When the user describes a turning point that EXTENDS the storyline past "
+    "its current end (cues like 'and after that…', 'in 2038…', "
+    "'next decision…'), leave `fork_from` empty — either omit `rewire_from` "
+    "for auto-rewire, or list specific terminal branches in `rewire_from`. "
+    "When the user describes an ALTERNATIVE or DIVERGENT past decision "
+    "(cues like 'what if instead', 'imagine that in 2028…', 'fork from', "
+    "'diverge', 'counterfactual', or any 'instead of X, do Y' framing), use "
+    "`fork_from` to attach the new node to the relevant past turning point(s). "
+    "The existing branches at those nodes stay intact, so the original "
+    "storyline remains explorable alongside the divergent one. Pick a "
+    "`probability` that reflects the user's framing (e.g. 'a small chance' "
+    "≈ 0.10–0.20); do NOT rebalance the existing branches — the simulator "
+    "normalises at run time. "
+    "Never set `next_node_id` on a `fork_from.branch` — the server sets it "
+    "for you. Setting it manually will be rejected as out-of-scope. "
+
+    "Pick the new node's `year` so that every predecessor that links INTO it "
+    "is chronologically prior or simultaneous. Concretely: every `rewire_from` "
+    "host node and every `fork_from.from_node_id` must have `year ≤ new_node.year`. "
+    "When omitting `rewire_from` (auto-rewire), pick a `year` strictly later "
+    "than every currently-terminal branch's host year — otherwise the server "
+    "will reject the diff with a 'chronological contradiction' / 'unreachable' "
+    "error because the only valid predecessors are in the past."
 )
 
 
@@ -349,6 +384,48 @@ APPLY_SCENARIO_DIFF_TOOL: Dict[str, Any] = {
                             "type": "object",
                             "description": "Full new node object (required for add_node).",
                         },
+                        "rewire_from": {
+                            "type": "array",
+                            "description": (
+                                "Specific terminal branches to rewire into the "
+                                "new node. Omit to auto-rewire all terminal "
+                                "branches. Only valid for `add_node`."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "node_id": {"type": "string"},
+                                    "branch_id": {"type": "string"},
+                                },
+                                "required": ["node_id", "branch_id"],
+                            },
+                        },
+                        "fork_from": {
+                            "type": "array",
+                            "description": (
+                                "Past nodes that should sprout a NEW branch "
+                                "pointing at the new node, modelling a divergent "
+                                "storyline. Existing branches on those nodes are "
+                                "preserved. Only valid for `add_node`."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "from_node_id": {"type": "string"},
+                                    "branch": {
+                                        "type": "object",
+                                        "description": (
+                                            "Full new branch object — same shape "
+                                            "as the `branch` field on `add_branch` "
+                                            "(id, label, description, probability, "
+                                            "metric_delta). Do NOT include "
+                                            "next_node_id; the server sets it."
+                                        ),
+                                    },
+                                },
+                                "required": ["from_node_id", "branch"],
+                            },
+                        },
                     },
                     "required": ["op"],
                 },
@@ -373,21 +450,40 @@ def _load_scenarios() -> List[Dict[str, Any]]:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=500, detail=f"scenarios.json is malformed: {exc}")
 
-    # Support both flat list and future {base:[...], user:[...]} layouts.
+    # Phase 10.1 layout: {base: [...], user: [...]}. Flat-list layout still
+    # accepted for backwards compatibility with older fixtures.
     if isinstance(raw, dict):
-        scenarios: List[Dict[str, Any]] = list(raw.get("base", [])) + list(raw.get("user", []))
+        base_list = list(raw.get("base", []))
+        user_list = list(raw.get("user", []))
     else:
-        scenarios = list(raw)
+        base_list = [s for s in raw if s.get("source") != "user"]
+        user_list = [s for s in raw if s.get("source") == "user"]
 
-    # Inject source:"base" for seeded entries so CRUD endpoints can reliably
-    # distinguish them from user-created scenarios without schema migration.
-    for s in scenarios:
-        s.setdefault("source", "base")
-    return scenarios
+    for s in base_list:
+        s["source"] = "base"
+    for s in user_list:
+        s["source"] = "user"
+    return base_list + user_list
 
 
 def _save_scenarios(scenarios: List[Dict[str, Any]]) -> None:
-    SCENARIOS_PATH.write_text(json.dumps(scenarios, indent=2, ensure_ascii=False), encoding="utf-8")
+    """Persist the scenario list back as the {base, user} layout (Phase 10.1).
+
+    The on-disk layout splits read-only seed scenarios from mutable user
+    variants so that simple file inspection makes the boundary obvious. The
+    in-memory `source` key is stripped from each entry on the way out — the
+    layout itself encodes provenance, and re-injection happens on load.
+    """
+    base_list: List[Dict[str, Any]] = []
+    user_list: List[Dict[str, Any]] = []
+    for s in scenarios:
+        clean = {k: v for k, v in s.items() if k != "source"}
+        if s.get("source") == "user":
+            user_list.append(clean)
+        else:
+            base_list.append(clean)
+    payload = {"base": base_list, "user": user_list}
+    SCENARIOS_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _find_scenario(scenarios: List[Dict[str, Any]], scenario_id: str) -> Dict[str, Any]:
@@ -609,13 +705,53 @@ async def create_scenario(req: SaveScenarioRequest) -> Dict[str, Any]:
 
 
 class UpdateScenarioRequest(BaseModel):
+    """Phase 10.4: PUT is metadata-only. Graph keys are rejected up front.
+
+    Pydantic's `model_config = {"extra": "forbid"}` makes any unknown field
+    surface as a 422 from FastAPI; combined with the explicit guard below,
+    this prevents in-place graph mutation on user scenarios.
+    """
+
+    model_config = {"extra": "forbid"}
+
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = Field(None, max_length=2000)
 
 
+# Graph-shaped keys that must NEVER be mutated in place — see §10.4. Edits to
+# these route through POST /scenarios with parent_id, producing a new variant.
+_FORBIDDEN_GRAPH_KEYS = frozenset({
+    "nodes",
+    "timeline",
+    "metrics",
+    "strategic_profiles",
+    "competitors",
+    "market_share_projection",
+})
+
+
 @app.put("/scenarios/{scenario_id}", dependencies=[Depends(require_bearer)])
 async def update_scenario(scenario_id: str, req: UpdateScenarioRequest) -> Dict[str, Any]:
-    """Rename or update the description of a user-created scenario."""
+    """Rename or update the description of a user-created scenario.
+
+    Phase 10.4 contract: this endpoint is metadata-only. Any payload carrying
+    `nodes`, `timeline`, `metrics`, etc. is rejected with HTTP 400. To change
+    the visualizing graph, save a new variant via POST /scenarios with the
+    current scenario as parent_id.
+    """
+    # Defence in depth — even if the schema were relaxed, this guard stays.
+    raw_payload = req.model_dump(exclude_unset=True)
+    bad = [k for k in raw_payload if k in _FORBIDDEN_GRAPH_KEYS]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"PUT /scenarios is metadata-only — fields {sorted(bad)} are not "
+                "editable in place. To change the visualizing graph, save a new "
+                "variant via POST /scenarios with parent_id set to this scenario."
+            ),
+        )
+
     scenarios = _load_scenarios()
     target = _find_scenario(scenarios, scenario_id)
 
@@ -637,7 +773,13 @@ async def update_scenario(scenario_id: str, req: UpdateScenarioRequest) -> Dict[
 
 @app.delete("/scenarios/{scenario_id}", dependencies=[Depends(require_bearer)], status_code=204)
 async def delete_scenario(scenario_id: str) -> None:
-    """Delete a user-created scenario. Returns 403 for base scenarios."""
+    """Delete a user-created scenario. Returns 403 for base scenarios.
+
+    Per Phase 10.4, deletion does NOT cascade to children: variants whose
+    `parent_id` points at the deleted scenario keep that pointer, and the UI
+    annotates them as "(deleted parent)" rather than purging them — so a
+    single bad delete does not destroy a derived edit history.
+    """
     scenarios = _load_scenarios()
     target = _find_scenario(scenarios, scenario_id)
 
@@ -647,15 +789,127 @@ async def delete_scenario(scenario_id: str) -> None:
     _save_scenarios([s for s in scenarios if s.get("id") != scenario_id])
 
 
+# ---------------------------------------------------------------------------
+# Phase 10.1 — Export / Import (self-contained scenario files)
+# ---------------------------------------------------------------------------
+
+REQUIRED_IMPORT_KEYS = frozenset({"id", "name", "nodes", "timeline"})
+
+
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-_.")
+    return s.lower() or "scenario"
+
+
+def _suggest_rename(scenarios: List[Dict[str, Any]], name: str) -> str:
+    """Append a suffix until the name is free — mirrors the UI's '(2)' pattern."""
+    base = name
+    n = 2
+    while any(s.get("name") == name for s in scenarios):
+        name = f"{base} ({n})"
+        n += 1
+    return name
+
+
+@app.get("/scenarios/{scenario_id}/export", dependencies=[Depends(require_bearer)])
+async def export_scenario(scenario_id: str) -> JSONResponse:
+    """Return the scenario object as a downloadable `<slug>.scenario.json`.
+
+    The export is self-contained: it carries the full `nodes`, `timeline`, and
+    derived `market_share_projection` so it can be re-imported on a different
+    instance without referencing the source scenarios.json.
+    """
+    scenarios = _load_scenarios()
+    target = _find_scenario(scenarios, scenario_id)
+    filename = f"{_slugify(target.get('name') or scenario_id)}.scenario.json"
+    return JSONResponse(
+        target,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/scenarios/import", dependencies=[Depends(require_bearer)])
+async def import_scenario(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """Accept a `.scenario.json` upload, validate, assign a fresh id, persist.
+
+    Always saves into the `user` array — imports never become base scenarios.
+    Duplicate-name conflicts surface as HTTP 409 with a `suggested_name` so
+    the client can offer one-click rename + retry.
+    """
+    name = (file.filename or "").lower()
+    if not (name.endswith(".scenario.json") or name.endswith(".json")):
+        raise HTTPException(
+            status_code=400,
+            detail="Upload must be a .scenario.json (or .json) file.",
+        )
+
+    raw = await file.read()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse JSON: {exc}")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Top-level value must be a scenario object.")
+    missing = REQUIRED_IMPORT_KEYS - set(payload.keys())
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Imported scenario is missing required keys: {sorted(missing)}",
+        )
+
+    scenarios = _load_scenarios()
+    requested_name = payload.get("name") or "Imported scenario"
+    if any(s.get("name") == requested_name for s in scenarios):
+        suggested = _suggest_rename(scenarios, requested_name)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Scenario name {requested_name!r} already exists.",
+                "suggested_name": suggested,
+            },
+        )
+
+    new_id = f"user-{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    # Strip identity / provenance fields so the import is treated as a fresh
+    # user variant — the original `id`, `source`, and timestamps are replaced.
+    cleaned = {
+        k: v for k, v in payload.items()
+        if k not in {"id", "source", "created_at", "updated_at"}
+    }
+    new_scenario = {
+        **cleaned,
+        "id": new_id,
+        "name": requested_name,
+        "source": "user",
+        "parent_id": payload.get("parent_id"),
+        "created_at": now,
+        "updated_at": now,
+    }
+    scenarios.append(new_scenario)
+    _save_scenarios(scenarios)
+
+    return {
+        "id": new_id,
+        "name": requested_name,
+        "source": "user",
+        "parent_id": new_scenario.get("parent_id"),
+        "created_at": now,
+    }
+
+
 @app.post("/expand", dependencies=[Depends(require_bearer)])
 async def post_expand(req: ExpandRequest) -> Dict[str, Any]:
-    """Phase 8: extend the scenario line in response to a user question.
+    """Phase 8 + Phase 10.6: extend the scenario line with a new TurningPoint
+    in response to a user question and return a preview WITHOUT mutating
+    ``data/scenarios.json``.
 
-    The model is asked to mint a new TurningPointNode that logically follows
-    from the last turning point, and to list every currently-terminal branch
-    so the server can rewire them to flow into the new node. Rewiring and the
-    node insertion are applied atomically via
-    `scenario_patch.expand_scenario`.
+    The expansion is applied to a deep copy and surfaced to the client. The
+    user explicitly saves the result as a NEW user scenario via
+    ``POST /scenarios`` with ``parent_id`` set to the source — mirroring the
+    ``/revise`` → Save-as-New flow from Phase 9.3 and matching the Phase 10.4
+    non-destructive-edit invariant ("the source row is never mutated").
     """
     scenarios = _load_scenarios()
     target = _find_scenario(scenarios, req.scenario_id)
@@ -695,7 +949,8 @@ async def post_expand(req: ExpandRequest) -> Dict[str, Any]:
             detail="Expansion tool call missing `new_node` or `rewire_branches`.",
         )
 
-    # Dry-run on a deep copy — if validation fails the live file isn't touched.
+    # Apply on a deep copy ONLY — Phase 10.6 makes /expand non-destructive.
+    # The caller persists explicitly via POST /scenarios.
     draft = copy.deepcopy(scenarios)
     diff_op = {
         "op": "expand_scenario",
@@ -709,18 +964,19 @@ async def post_expand(req: ExpandRequest) -> Dict[str, Any]:
     except DiffError as exc:
         raise HTTPException(status_code=422, detail=f"Expansion rejected: {exc}")
 
-    SCENARIOS_PATH.write_text(json.dumps(draft, indent=2, ensure_ascii=False), encoding="utf-8")
+    preview_scenario = _find_scenario(draft, req.scenario_id)
 
     return {
-        "status": "applied",
+        "status": "preview",
         "summary": summary,
         "new_node": new_node,
         "rewire_branches": rewires,
-        "scenarios": draft,
+        "preview_scenario": preview_scenario,
         "note": (
-            "Scenario expanded. The 18 auto-generated path variants in "
-            "scenarios_generated.json are NOT re-computed — re-run "
-            "`python3 src/engine/simulator.py` to refresh them."
+            "Expansion applied to a preview only — data/scenarios.json was NOT "
+            "modified. Save as a new user scenario via the chat panel's "
+            "'Save as new' button (POST /scenarios with parent_id set to the "
+            "source scenario)."
         ),
         "usage": {
             "input_tokens": response.usage.input_tokens,

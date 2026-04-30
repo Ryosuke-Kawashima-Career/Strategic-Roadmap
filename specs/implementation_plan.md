@@ -297,7 +297,143 @@ Update `REVISE_SYSTEM_PREAMBLE` to instruct Claude that `rewire_from` should be 
 - [ ] Discarding the preview fully restores the original node styling — no amber or dashed borders remain.
 - [ ] Saving the preview as a new scenario persists the standard (non-diff) styling in the selector and subsequent loads.
 
-### Phase 10: Scenario Management (FR-7)
+#### 9.5 Revision of Phase 9.4 — Divergent Branch Creation
+
+Phase 9.4 closed the floating-island bug by auto-rewiring terminal branches into a newly-added node. That covers **continuation** — the new node extends the storyline past its current last endpoint. Real strategy questions, however, are usually divergent: *"what if, in 2028, eDreams had cancelled Prime instead of doubling down?"* The expected answer is a NEW path that sprouts off a **past, mid-graph turning point**, runs in parallel with the original storyline, and reaches its own 2040 outcomes — without overwriting the existing edges.
+
+Phase 9.5 adds that second topology while keeping 9.4's continuation behaviour intact, and codifies a single connectivity invariant that both modes must satisfy.
+
+##### 9.5.1 Connectivity Invariant
+
+> Every node introduced via `/revise` MUST have at least one incoming edge from a node that already existed before the revision. The new node's outgoing branches MAY remain terminal — divergent storylines are not required to merge back into existing 2040 outcomes.
+
+This invariant supersedes the looser 9.4.4 wording ("incoming arrow from a previously-terminal branch"): the incoming edge can now also come from a *new branch sprouted onto a past node*. Both 9.4 (continuation) and 9.5 (divergence) are special cases of this single rule.
+
+##### 9.5.2 Two Wiring Modes on `add_node`
+
+Extend `add_node` so the LLM picks the mode matching the user's intent:
+
+| Mode | Field | Effect |
+| --- | --- | --- |
+| **Continuation** (9.4) | `rewire_from` (existing) | Redirects previously-terminal branches' `next_node_id` to the new node. The new node becomes the new tail. |
+| **Continuation auto** (9.4) | *neither field set* | Auto-rewires every terminal branch. Convenient default when the scenario has a single tail. |
+| **Divergence** (9.5, new) | `fork_from` (new) | ADDS a new branch onto each listed past node, pointing at the new node. Existing branches on those past nodes are preserved untouched. |
+
+The two fields can co-exist (rare; see §9.5.4). The system preamble (§9.5.6) trains Claude to pick exactly one based on the user's phrasing.
+
+##### 9.5.3 `fork_from` Field Shape
+
+```json
+"fork_from": [
+  {
+    "from_node_id": "tp-002",
+    "branch": {
+      "id": "tp-002-d",
+      "label": "Cancel Prime, fund eDreams Lab",
+      "description": "Counterfactual: redirect Prime budget into a GenAI R&D arm.",
+      "probability": 0.15,
+      "metric_delta": {
+        "revenue_index": -0.05,
+        "market_share": 0.00,
+        "tech_adoption_velocity": 0.10
+      }
+    }
+  }
+]
+```
+
+Each entry describes a brand-new branch to be appended to `from_node_id.branches`, with `next_node_id` set automatically by the server to the new node's `id`. The branch object reuses the same shape `add_branch` already validates — no new field schema to learn.
+
+##### 9.5.4 Server Implementation (`src/api/scenario_patch.py::_add_node`)
+
+Extend `_add_node` after the existing `rewire_from` block, before the final mutation step:
+
+1. Read `fork_from = diff.get("fork_from") or []`. Validate it is a list of objects.
+2. For each entry:
+    - Resolve `from_node_id` via `_find_node` (raise `DiffError` on unknown).
+    - Validate `branch` carries the same required fields enforced by `_add_branch` (`id`, `label`, `description`, `metric_delta`, `probability`).
+    - Reject if `branch.id` collides with any existing branch id on the target node (`DiffError`).
+    - Stamp `branch["next_node_id"] = node["id"]` server-side. The LLM does NOT supply `next_node_id` — the preamble forbids it, and the server is the single source of truth for that edge.
+3. **Buffer the planned mutations** (`fork_targets: List[Tuple[node_dict, branch_dict]]`) — do not append to any node yet. This keeps the operation atomic: if the connectivity check in step 5 fails, no partial state is written.
+4. Compute the `rewire_targets` list as today (terminal branches when `rewire_from` is omitted; the validated subset when it is supplied).
+5. **Connectivity check (the new invariant guard)** — count the post-mutation in-degree of the new node:
+
+    ```python
+    incoming = len(rewire_targets) + len(fork_targets)
+    if incoming == 0:
+        raise DiffError(
+            f"add_node {node['id']!r} would leave the new node unreachable. "
+            "Either supply `rewire_from` (continuation), `fork_from` (divergence), "
+            "or ensure the scenario has at least one terminal branch for "
+            "auto-rewire to use."
+        )
+    ```
+
+6. Apply mutations atomically: append the new node, apply `rewire_targets[*].next_node_id = node["id"]`, then for each `(host_node, new_branch)` in `fork_targets` do `host_node["branches"].append(new_branch)`.
+
+The behaviour for an `add_node` op carrying both `rewire_from` and `fork_from` is: apply both. Used when a divergent line is also designated as the new tail of the original storyline (uncommon; the preamble discourages it but the implementation should not reject it).
+
+##### 9.5.5 Tool Schema Update (`src/api/server.py`)
+
+Add `fork_from` alongside `rewire_from` in `APPLY_SCENARIO_DIFF_TOOL.input_schema.properties.operations.items.properties`:
+
+```json
+"fork_from": {
+  "type": "array",
+  "description": "Past nodes that should sprout a NEW branch pointing at the new node, modelling a divergent storyline. Existing branches on those nodes are preserved. Only valid for `add_node`.",
+  "items": {
+    "type": "object",
+    "properties": {
+      "from_node_id": { "type": "string" },
+      "branch": {
+        "type": "object",
+        "description": "Full new branch object — same shape as the `branch` field on `add_branch` (id, label, description, probability, metric_delta). Do NOT include next_node_id; the server sets it."
+      }
+    },
+    "required": ["from_node_id", "branch"]
+  }
+}
+```
+
+##### 9.5.6 System Preamble Update (`REVISE_SYSTEM_PREAMBLE`)
+
+Append guidance that lets Claude pick the right mode from natural-language cues:
+
+- *"When the user describes a turning point that EXTENDS the storyline past its current end ('and after that…', 'in 2038…', 'next decision…'), leave `fork_from` empty. Either omit `rewire_from` for auto-rewire, or list specific terminal branches in `rewire_from`."*
+- *"When the user describes an ALTERNATIVE or DIVERGENT past decision — signalled by phrases like 'what if instead', 'imagine that in 2028…', 'fork from', 'diverge', 'counterfactual', or any 'instead of X, do Y' framing — use `fork_from` to attach the new node to the relevant past turning point(s). The existing branches at those nodes stay intact, so the original storyline remains explorable alongside the divergent one. Pick a `probability` that reflects the user's framing (e.g. 'a small chance' ≈ 0.10–0.20; do NOT rebalance the existing branches — the simulator normalises at run time)."*
+- *"Never set `next_node_id` on a `fork_from.branch` — the server sets it for you. Setting it manually will be rejected as out-of-scope."*
+
+##### 9.5.7 Test Coverage (`tests/test_wargame.py`)
+
+Add `test_every_node_is_reachable` that asserts the connectivity invariant on every scenario the simulator emits AND every patched preview:
+
+- Build the directed edge set from `nodes[*].branches[*].next_node_id` plus the implicit historical-chain edges that `buildDef` synthesises.
+- For each turning-point node, assert `in_degree(node) >= 1`.
+- Then exercise three `apply_diff` cases against `fresh_scenario()`:
+  1. `add_node` with no `rewire_from`/`fork_from` → invariant holds via auto-rewire.
+  2. `add_node` with `fork_from = [{from_node_id: "tp-002", branch: {...}}]` → invariant holds AND `tp-002`'s original branches are unchanged in count and content.
+  3. `add_node` against a synthetic scenario with zero terminal branches and no `fork_from` → expects `DiffError`.
+
+##### 9.5.8 UI Implications (No New Client Code)
+
+The visual-diff overlay shipped in 9.4.2 already covers the divergence topology for free:
+
+- The new node renders dashed amber + `✦` prefix (it is in `addedNodeIds`).
+- The freshly-sprouted branch on the past node renders amber (its branch id is in `changedBranchIds` because it did not exist in `previewSnapshot`).
+- The past node's original branches stay faded but visible — the planner sees both the original storyline and the divergent fork side-by-side.
+
+The only documentation work is a short paragraph in `docs/walkthrough.md` (Phase 9 section) explaining "continuation vs. divergence" so non-engineer reviewers can read the flowchart correctly.
+
+##### 9.5.9 Acceptance Criteria for Phase 9.5
+
+- [ ] `add_node` with `fork_from` produces a graph in which every listed past node retains its original branches AND gains exactly one new branch pointing at the new node, with `next_node_id` set by the server.
+- [ ] `add_node` with neither `rewire_from` nor `fork_from` still auto-rewires terminal branches (9.4.1 behaviour preserved — no regression).
+- [ ] `add_node` that would leave the new node unreachable (zero rewire targets AND zero fork targets) raises `DiffError` with the new-message wording from §9.5.4 step 5.
+- [ ] `test_every_node_is_reachable` passes on every base scenario and on all three `apply_diff` cases listed in §9.5.7.
+- [ ] A `/revise` call seeded with *"what if instead, in 2028, eDreams had cancelled Prime?"* returns a tool call whose `add_node` operation uses `fork_from` (not `rewire_from`), and the resulting preview shows the past node with both its original branches and the new amber fork.
+- [ ] Saving the preview as a new scenario persists both the new node AND the new fork branches; subsequent loads render the divergent topology correctly without diff styling.
+
+### Phase 10: Scenario and Data Management (FR-7)
 
 FR-7 delivers full lifecycle control over scenarios — create, rename, delete, export, and import — so that AI-generated variants and custom planners' edits become persistent, shareable artefacts rather than ephemeral session state.
 
@@ -325,13 +461,56 @@ The existing scenario selector dropdown gains two visual cues without a layout c
 - A **bookmark icon** prefix on user-saved variants (mirrors the chat-panel context indicator from Phase 9.3).
 - An **"Unsaved changes" dot** while a `/revise` preview is active but not yet saved — a reminder to either save or discard.
 
-#### 10.4 Acceptance Criteria for Phase 10
+#### 10.4 Non-Destructive Edit Semantics (FR-7 update)
+
+User-story addition (§FR-7): *"You should update the data of visualizing graph, without deleting the original data."*
+
+Every edit path — natural-language `/revise` (Phase 9.3) and direct manipulation via the Scenario Manager (§10.2) — produces a NEW scenario entry linked to its source via `parent_id`. The source row in `data/scenarios.json` is never mutated by an edit. This applies symmetrically to base **and** user scenarios:
+
+- **Base scenarios** — already protected by the HTTP 403 returned from `PUT /scenarios/{id}` and `DELETE /scenarios/{id}` (Phase 9.1). The `/revise` → Save-as-New flow (Phase 9.3) is the only mutation path, and it always emits a new `source: "user"` entry whose `parent_id` points at the base scenario.
+- **User scenarios** — `PUT /scenarios/{id}` is restricted to **metadata only** (`name`, `description`); it does not accept `nodes`, `timeline`, `metrics`, or any field that affects the visualizing graph. Payloads carrying graph keys are rejected with HTTP 400. Graph-level edits route through `POST /scenarios` with the user-scenario `id` as `parent_id`, producing a new variant alongside the original. This keeps the version chain auditable and lets the planner roll back by selecting the parent.
+- **Preview lifecycle** — the Phase 9.5 preview/discard semantics already enforce the same invariant in-flight: a `/revise` preview lives only in client memory until the planner clicks **Save as New**; **Discard preview** restores the snapshot without ever calling a mutating endpoint, so an aborted edit cannot reach `data/scenarios.json`.
+
+Version chain in the UI:
+
+- The **Scenario Manager** library list (§10.2) renders each row's `parent_id` as a focus link; clicking it scrolls to and highlights the parent row, letting the planner walk the chain back to its base ancestor.
+- The scenario selector dropdown (§10.3) indents variants under their parent so a forked tree of edits is visually obvious without opening the Manager.
+- Deleting a user scenario (`DELETE /scenarios/{id}`) does NOT cascade to its children — orphaned variants keep their `parent_id` pointing at a now-missing record. The Manager surfaces this as a faded "(deleted parent)" annotation rather than purging the children, so the planner's edit history survives a single bad delete.
+
+#### 10.5 Scenario Update Logic Refinement
+
+Situation:
+Currently, the LLM generates a new scenario branch base on the user's output. However, this can make a chronological contradiction when the new branch is integrated to the exsiting scenario. The contradiction is the next node before which the output branch was inserted, is a node that shows a prior event of the inserted branch.
+
+Task:
+Develop the code logic that prevents the chronological contradiction when updating the scenario. You should note that the tail of the new branch does not necessarily merge into the existing scenario branch. What should be connected to the main branch is the **head** of the new branch.
+
+Action:
+Modify `src/api/scenario_patch.py` and other relevant files to implement the scenario update logic.
+
+#### 10.6 Turning Point Expansion Save Function
+
+Situtation:
+Currently, the user can ask the LLM to make a turning point of the scenario line so that the user can predict the trend of the OTA industry.However, after loading the changes, there is no way to save the changes to the scenario.
+
+Task:
+Develop the code logic that saves the changes to the scenario when using Expand/Turn-Point tool use.
+
+Action:
+
+- Analyze the `Expand/Turn-Point` tool use in `src/api/server.py`, and `src/api/scenario_patch.py`.
+- Modify relevant files to save the changes to the scenario.
+
+#### 10.7 Acceptance Criteria for Phase 10
 
 - [ ] User-created scenarios persist across browser reloads and server restarts (backed by `data/scenarios.json`).
 - [ ] Base scenarios cannot be renamed, edited metadata of, or deleted via the API (HTTP 403 enforced).
+- [ ] **Editing any existing scenario produces a new entry whose `parent_id` points to the source; the source row in `data/scenarios.json` is never mutated.** Verified for both base scenarios (via `/revise` → Save as New) and user scenarios (via Scenario Manager edits and `/revise`).
+- [ ] `PUT /scenarios/{id}` rejects payloads containing `nodes`, `timeline`, or `metrics` keys with HTTP 400 — metadata-only edits are the sole in-place mutation path for user scenarios.
 - [ ] A scenario exported from one session and imported into another round-trips without data loss — the imported scenario renders identically in the flowchart and market-share chart.
 - [ ] Renaming a scenario updates the selector dropdown in real time without a page reload.
 - [ ] Deleting a scenario that is currently active in the chat session gracefully falls back to the first base scenario and shows a dismissible toast notification.
+- [ ] Deleting a user scenario that has children leaves the children intact; the Manager flags them as "(deleted parent)" without auto-purging.
 - [ ] The Scenario Manager panel is reachable via keyboard navigation and its controls carry `aria-label` attributes.
 
 ### Phase 11: Google Cloud Deployment (Internal Access)
